@@ -3,25 +3,12 @@ const fs = require('fs')
 const path = require('path')
 const express = require('express')
 const request = require('./util/request')
-const packageJSON = require('./package.json')
-const exec = require('child_process').exec
 const cache = require('./util/apicache').middleware
 const { cookieToJson } = require('./util/index')
 const fileUpload = require('express-fileupload')
 const decode = require('safe-decode-uri-component')
 const logger = require('./util/logger.js')
 const { APP_CONF } = require('./util/config.json')
-
-/**
- * The version check result.
- * @readonly
- * @enum {number}
- */
-const VERSION_CHECK_RESULT = {
-  FAILED: -1,
-  NOT_LATEST: 0,
-  LATEST: 1,
-}
 
 /**
  * @typedef {{
@@ -35,17 +22,8 @@ const VERSION_CHECK_RESULT = {
  * @typedef {{
  *   port?: number,
  *   host?: string,
- *   checkVersion?: boolean,
  *   moduleDefs?: ModuleDefinition[]
  * }} NcmApiOptions
- */
-
-/**
- * @typedef {{
- *   status: VERSION_CHECK_RESULT,
- *   ourVersion?: string,
- *   npmVersion?: string,
- * }} VersionCheckResult
  */
 
 /**
@@ -89,43 +67,6 @@ async function getModulesDefinitions(
     })
 
   return modules
-}
-
-/**
- * Check if the version of this API is latest.
- *
- * @returns {Promise<VersionCheckResult>} If true, this API is up-to-date;
- * otherwise, this API should be upgraded and you would
- * need to notify users to upgrade it manually.
- */
-async function checkVersion() {
-  return new Promise((resolve) => {
-    exec('npm info NeteaseCloudMusicApiEnhanced version', (err, stdout) => {
-      if (!err) {
-        let version = stdout.trim()
-
-        /**
-         * @param {VERSION_CHECK_RESULT} status
-         */
-        const resolveStatus = (status) =>
-          resolve({
-            status,
-            ourVersion: packageJSON.version,
-            npmVersion: version,
-          })
-
-        resolveStatus(
-          packageJSON.version < version
-            ? VERSION_CHECK_RESULT.NOT_LATEST
-            : VERSION_CHECK_RESULT.LATEST,
-        )
-      } else {
-        resolve({
-          status: VERSION_CHECK_RESULT.FAILED,
-        })
-      }
-    })
-  })
 }
 
 function parseCorsAllowOrigins(corsAllowOrigin) {
@@ -421,21 +362,9 @@ async function serveNcmApi(options) {
 
   const spinner = createConsoleSpinner('服务启动中')
 
-  const checkVersionSubmission =
-    options.checkVersion &&
-    checkVersion().then(({ npmVersion, ourVersion, status }) => {
-      if (status == VERSION_CHECK_RESULT.NOT_LATEST) {
-        logger.warn(
-          `最新版本: ${npmVersion}, 当前版本: ${ourVersion}, 请及时更新`,
-        )
-      }
-    })
   const constructServerSubmission = constructServer(options.moduleDefs)
 
-  const [_, app] = await Promise.all([
-    checkVersionSubmission,
-    constructServerSubmission,
-  ])
+  const app = await constructServerSubmission
 
   spinner.stop()
 

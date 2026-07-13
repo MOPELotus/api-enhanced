@@ -1,36 +1,182 @@
-name: Upstream Sync
+name: Sync upstream and release binaries
+
+on:
+  schedule:
+    # 12:00 Beijing time (UTC+8) every day.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: Build and publish the current main branch even when upstream has no new commits.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
-on:
-  schedule:
-    - cron: "0 4 * * *" # At 12PM UTC+8
-  workflow_dispatch:
+concurrency:
+  group: sync-and-release-main
+  cancel-in-progress: false
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    name: Sync new upstream commits
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
+    outputs:
+      should_release: ${{ steps.sync.outputs.should_release }}
+      release_sha: ${{ steps.sync.outputs.release_sha }}
 
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
-        uses: actions/checkout@v6
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
+      - name: Checkout main
+        uses: actions/checkout@v7
         with:
-          upstream_sync_repo: NeteaseCloudMusicApiEnhanced/api-enhanced
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
-      - name: Sync check
-        if: failure()
+      - name: Merge new upstream commits
+        id: sync
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FORCE_RELEASE: ${{ inputs.force_release || 'false' }}
+          UPSTREAM_REPOSITORY: NeteaseCloudMusicApiEnhanced/api-enhanced
         run: |
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-          exit 1
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "$DEFAULT_BRANCH"
+
+          should_release=false
+          if [ -n "$(git log --format=%H HEAD..upstream/$DEFAULT_BRANCH)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git merge --no-edit "upstream/$DEFAULT_BRANCH"
+            git push origin "HEAD:$DEFAULT_BRANCH"
+            should_release=true
+          fi
+
+          if [ "$FORCE_RELEASE" = "true" ]; then
+            should_release=true
+          fi
+
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  timestamp:
+    name: Create Beijing release timestamp
+    needs: sync
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.timestamp.outputs.tag }}
+
+    steps:
+      - name: Generate timestamp
+        id: timestamp
+        shell: bash
+        run: |
+          timestamp="$(TZ=Asia/Shanghai date '+%Y%m%d-%H%M%S')"
+          echo "tag=$timestamp" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }} binary
+    needs:
+      - sync
+      - timestamp
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: Linux
+            target: node18-linux-x64
+            asset: ncm-api-linux-x64
+          - os: windows-latest
+            platform: Windows
+            target: node18-win-x64
+            asset: ncm-api-windows-x64.exe
+          - os: macos-latest
+            platform: macos
+            target: node18-macos-x64
+            asset: ncm-api-macos-x64
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.release_sha }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 18
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build fixed-name binary
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          pnpm exec pkg . \
+            --targets "${{ matrix.target }}" \
+            --compress GZip \
+            --output "release-artifacts/${{ matrix.asset }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: release-artifacts/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - sync
+      - timestamp
+      - build
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          pattern: ncm-api-*
+          merge-multiple: true
+
+      - name: Verify release files
+        shell: bash
+        run: |
+          ls -lh release-artifacts
+          test -f release-artifacts/ncm-api-linux-x64
+          test -f release-artifacts/ncm-api-windows-x64.exe
+          test -f release-artifacts/ncm-api-macos-x64
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.sync.outputs.release_sha }}
+          TAG: ${{ needs.timestamp.outputs.tag }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            release-artifacts/ncm-api-linux-x64 \
+            release-artifacts/ncm-api-windows-x64.exe \
+            release-artifacts/ncm-api-macos-x64 \
+            --target "$RELEASE_SHA" \
+            --title "$TAG" \
+            --notes "Automated build from upstream sync. Source commit: $RELEASE_SHA. Asset filenames are stable across releases."
