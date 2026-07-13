@@ -151,6 +151,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.release_sha }}
+
       - name: Download binaries
         uses: actions/download-artifact@v8
         with:
