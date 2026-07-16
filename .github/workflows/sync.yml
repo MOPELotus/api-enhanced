@@ -26,6 +26,7 @@ jobs:
     outputs:
       should_release: ${{ steps.sync.outputs.should_release }}
       release_sha: ${{ steps.sync.outputs.release_sha }}
+      upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
 
     steps:
       - name: Checkout main
@@ -47,6 +48,9 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null || \
             git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --no-tags upstream "$DEFAULT_BRANCH"
+          git fetch --force --tags upstream
+
+          upstream_tag="$(git tag --merged "upstream/$DEFAULT_BRANCH" --list 'v*' --sort=-version:refname | sed -n '1p')"
 
           should_release=false
           if [ -n "$(git log --format=%H HEAD..upstream/$DEFAULT_BRANCH)" ]; then
@@ -63,6 +67,7 @@ jobs:
 
           echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
 
   timestamp:
     name: Create Beijing release timestamp
@@ -176,12 +181,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.sync.outputs.release_sha }}
           TAG: ${{ needs.timestamp.outputs.tag }}
+          UPSTREAM_TAG: ${{ needs.sync.outputs.upstream_tag }}
         shell: bash
         run: |
+          release_title="$TAG"
+          release_notes="Automated build from upstream sync. Source commit: $RELEASE_SHA. Asset filenames are stable across releases."
+          if [ -n "$UPSTREAM_TAG" ]; then
+            release_title="$UPSTREAM_TAG · $TAG"
+            release_notes="Upstream release: $UPSTREAM_TAG. $release_notes"
+          fi
+
           gh release create "$TAG" \
             release-artifacts/ncm-api-linux-x64 \
             release-artifacts/ncm-api-windows-x64.exe \
             release-artifacts/ncm-api-macos-x64 \
             --target "$RELEASE_SHA" \
-            --title "$TAG" \
-            --notes "Automated build from upstream sync. Source commit: $RELEASE_SHA. Asset filenames are stable across releases."
+            --title "$release_title" \
+            --notes "$release_notes"
